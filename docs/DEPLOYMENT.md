@@ -1,6 +1,26 @@
 # RecallScope deployment record
 
-## Current deployment: v0.1.0 on Studionet
+## Current release candidate: v0.2.0 (not deployed)
+
+The current source adds the authority registry and authority-bound evidence mode. It is not live yet. The v0.1.0 deployment and lifecycle below are historical and must not be represented as v0.2.0 evidence.
+
+For release, deploy `RecallAuthorityRegistry` first, then deploy `RecallScope` with the registry address as its constructor argument. Use GenLayer Studionet chain ID `61999`, verify both deployments reach finality with successful GenVM execution, retrieve both deployed sources, and compare their exact bytes and SHA-256 values to the frozen repository files. Then register a clearly synthetic demo authority and complete a signed `AUTHORITY_BOUND` case through semantic review and designated-consumer acknowledgement. Do not describe a synthetic fixture as a real recall or real-world authority.
+
+The registry administrator is its deployer and a root of trust. A signer key registered for the demo proves only control of that key and its signed manifest; it does not prove real-world identity. Keep production authority signing keys offline and do not use the synthetic test key embedded in Direct Mode tests.
+
+Release commands from the repository root (Python 3.12+, pinned requirements):
+
+```powershell
+python -m pip install -r requirements.txt
+python scripts/preflight.py
+python -m pytest tests/direct -q
+genvm-lint check contracts/recallscope.py --json
+genvm-lint schema contracts/recallscope.py --output artifacts/recallscope.abi.json
+genvm-lint check contracts/authority_registry.py --json
+genvm-lint schema contracts/authority_registry.py --output artifacts/authority_registry.abi.json
+```
+
+## Historical deployment: v0.1.0 on Studionet
 
 - Contract: [0x58117a2D5a6332dDe2e303a5128D939c54270664](https://explorer-studio.genlayer.com/address/0x58117a2D5a6332dDe2e303a5128D939c54270664)
 - Deployment transaction: [0x2db9b6d748c185bd7767ffaeade07235d114de86ec4745228b445a822100e32e](https://explorer-studio.genlayer.com/tx/0x2db9b6d748c185bd7767ffaeade07235d114de86ec4745228b445a822100e32e)
@@ -13,23 +33,9 @@
 - Local and deployed source length: 24,023 bytes each; byte-for-byte comparison: **MATCH**
 - `get_info()`: `name=RecallScope`, `version=0.1.0`, `minimum_confidence=75`, `max_artifact_bytes=16000`, `max_label_image_bytes=1000000`, `max_cases_per_submitter_lifetime=64`
 
-Deployment evidence does not demonstrate application lifecycle behavior. No live case submission, semantic review, or consumer acknowledgement is recorded yet.
+This historical deployment does not contain the v0.2.0 authority-bound changes. Its synthetic application lifecycle is recorded below and remains valid only for that old source.
 
 The optional label image is committed by raw-byte SHA-256 and sent through the documented `gl.nondet.exec_prompt(images=[...])` interface only after hash, size, and JPEG/PNG framing checks. Vision-provider support is an external runtime assumption and can cause a review to remain inconclusive. Escrow is intentionally excluded: a safety warning should not depend on payment, and no beneficiary is selected by the protocol.
-
-## Pre-deployment release gate
-
-From the RecallScope repository root, using Python 3.12+:
-
-```powershell
-python -m pip install -r requirements.txt
-python scripts/preflight.py
-python -m pytest tests/direct -q
-genvm-lint check contracts/recallscope.py --json
-genvm-lint schema contracts/recallscope.py --output artifacts/recallscope.abi.json
-```
-
-Freeze source only after every check passes. Record the source commit and SHA-256 before deployment. Deploy only with the user's explicit instruction, then record the finalized deployment transaction, contract address, `get_info()` result, and deployed-source byte-for-byte parity if source retrieval is supported.
 
 ## Live application evidence
 

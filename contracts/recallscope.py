@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from genlayer import *
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 PENDING = "pending"
 RECALL_APPLIES = "recall_applies"
@@ -17,6 +17,10 @@ NOT_APPLICABLE = "not_applicable"
 INCONCLUSIVE = "inconclusive"
 CANCELLED = "cancelled"
 ACKNOWLEDGED = "acknowledged"
+AUTHORITY_REVOKED = "authority_revoked"
+AUTHORITY_EXPIRED = "authority_expired"
+OPEN_EVIDENCE = "OPEN_EVIDENCE"
+AUTHORITY_BOUND = "AUTHORITY_BOUND"
 
 ANALYSIS = "analysis"
 RETRYABLE = "retryable"
@@ -44,6 +48,20 @@ MAX_ARTIFACT_BYTES = 16000
 MAX_LABEL_IMAGE_BYTES = 1000000
 MAX_RATIONALE = 400
 MIN_CONFIDENCE = 75
+MAX_MANIFEST_LIFETIME = 31536000
+RSA_MODULUS_HEX_LENGTH = 512
+RSA_SIGNATURE_HEX_LENGTH = 512
+RSA_EXPONENT = 65537
+SHA256_DIGEST_INFO_PREFIX = "3031300d060960864801650304020105000420"
+
+
+@gl.contract_interface
+class RecallAuthorityRegistryIface:
+    class View:
+        def get_authority(self, authority_id: str) -> dict: ...
+
+    class Write:
+        pass
 
 
 @allow_storage
@@ -71,6 +89,22 @@ class RecallCase:
     submitted_at: u256
     reviewed_at: u256
     acknowledged_at: u256
+    evidence_mode: str
+    authority_id: str
+    authority_name: str
+    authority_signer_fingerprint: str
+    authority_modulus: str
+    authority_domains: str
+    authority_markets: str
+    authority_products: str
+    authority_revision: u256
+    authority_verified: bool
+    signed_notice_hash: str
+    manifest_hash: str
+    manifest_signature: str
+    recall_reference: str
+    manifest_issued_at: u256
+    manifest_expires_at: u256
 
 
 class RecallCaseSubmitted(gl.Event):
@@ -118,6 +152,81 @@ def canonical_sha256(value: str) -> str:
 
 def content_sha256(raw: bytes) -> str:
     return "0x" + hashlib.sha256(raw).hexdigest()
+
+
+def canonical_manifest_bytes(
+    chain_id: int,
+    scope_address: str,
+    registry_address: str,
+    case_id: str,
+    authority_id: str,
+    registry_revision: int,
+    notice_hash: str,
+    product_name: str,
+    model: str,
+    batch: str,
+    market: str,
+    issued_at: int,
+    expires_at: int,
+    recall_reference: str,
+) -> bytes:
+    """Length-prefixed UTF-8 fields, in fixed order, prevent delimiter ambiguity."""
+    fields = [
+        "RECALLSCOPE_AUTHORITY_MANIFEST_V1",
+        str(chain_id), scope_address.lower(), registry_address.lower(), case_id,
+        authority_id, str(registry_revision), notice_hash.lower(), product_name,
+        model, batch, market, str(issued_at), str(expires_at), recall_reference,
+    ]
+    result = b""
+    for field in fields:
+        raw = field.encode("utf-8")
+        result += str(len(raw)).encode("ascii") + b":" + raw
+    return result
+
+
+def rsa_pkcs1_v15_sha256_verify(modulus: str, signature: str, digest: str) -> bool:
+    """Strict fixed-size RSA-2048 PKCS#1 v1.5 SHA-256 verification."""
+    modulus_hex = str(modulus).lower().removeprefix("0x")
+    signature_hex = str(signature).lower().removeprefix("0x")
+    digest_hex = str(digest).lower().removeprefix("0x")
+    if len(modulus_hex) != RSA_MODULUS_HEX_LENGTH or len(signature_hex) != RSA_SIGNATURE_HEX_LENGTH:
+        return False
+    if not re.match(r"^[0-9a-f]+$", modulus_hex) or not re.match(r"^[0-9a-f]+$", signature_hex):
+        return False
+    if len(digest_hex) != 64 or not re.match(r"^[0-9a-f]{64}$", digest_hex):
+        return False
+    if modulus_hex[0] not in "89abcdef" or modulus_hex[-1] not in "13579bdf":
+        return False
+    modulus = int(modulus_hex, 16)
+    signature_value = int(signature_hex, 16)
+    if signature_value <= 0 or signature_value >= modulus:
+        return False
+    encoded = format(pow(signature_value, RSA_EXPONENT, modulus), "0512x")
+    digest_info = SHA256_DIGEST_INFO_PREFIX + digest_hex
+    padding_length = RSA_MODULUS_HEX_LENGTH - 6 - len(digest_info)
+    if padding_length < 16:
+        return False
+    expected = "0001" + ("ff" * (padding_length // 2)) + "00" + digest_info
+    return encoded == expected
+
+
+def notice_host(url: str) -> str:
+    return re.split(r"[/\?#]", str(url)[8:], maxsplit=1)[0].lower()
+
+
+def authority_snapshot_matches(case: RecallCase, authority: dict) -> bool:
+    return (
+        isinstance(authority, dict)
+        and bool(authority)
+        and authority.get("authority_id") == case.authority_id
+        and authority.get("active") is True
+        and int(authority.get("revision", 0)) == int(case.authority_revision)
+        and authority.get("signer_fingerprint") == case.authority_signer_fingerprint
+        and authority.get("signer_modulus") == case.authority_modulus
+        and authority.get("domains") == case.authority_domains
+        and authority.get("markets") == case.authority_markets
+        and authority.get("products") == case.authority_products
+    )
 
 
 def canonical_address_hex(value) -> str:
@@ -333,9 +442,13 @@ Different reasons for a confident not_applicable result need not be identical. F
 class RecallScope(gl.Contract):
     cases: TreeMap[str, RecallCase]
     submitter_case_counts: TreeMap[str, u256]
+    authority_registry: Address
 
-    def __init__(self):
-        pass
+    def __init__(self, authority_registry: Address):
+        registry = Address(authority_registry) if isinstance(authority_registry, bytes) else authority_registry
+        if canonical_address_hex(registry) == "0x" + ("0" * 40):
+            raise gl.vm.UserError("[EXPECTED] Zero authority registry")
+        self.authority_registry = registry
 
     def _key(self, case_id: str, proposer: Address) -> str:
         return canonical_address_hex(proposer) + ":" + case_id
@@ -347,57 +460,40 @@ class RecallScope(gl.Contract):
             raise gl.vm.UserError("[EXPECTED] Recall case not found")
         return value
 
-    @gl.public.write
-    def submit_case(
+    def _registry_authority(self, authority_id: str) -> dict:
+        return RecallAuthorityRegistryIface(self.authority_registry).view().get_authority(authority_id)
+
+    def _store_case(
         self,
-        case_id: str,
-        product_name: str,
-        model: str,
-        batch: str,
-        market: str,
-        consumer: Address,
-        product_record_url: str,
-        product_record_hash: str,
-        recall_notice_url: str,
-        recall_notice_hash: str,
-        label_image_url: str,
-        label_image_hash: str,
-        summary: str,
+        normalized_id: str,
+        product_name_value: str,
+        model_value: str,
+        batch_value: str,
+        market_value: str,
+        consumer_value: Address,
+        product_url_value: str,
+        product_hash_value: str,
+        notice_url_value: str,
+        notice_hash_value: str,
+        image_url_value: str,
+        image_hash_value: str,
+        summary_value: str,
+        evidence_mode: str,
+        authority: dict,
+        authority_id: str,
+        manifest_hash: str,
+        manifest_signature: str,
+        recall_reference: str,
+        issued_at: int,
+        expires_at: int,
     ) -> None:
-        normalized_id = valid_case_id(case_id)
         proposer = gl.message.sender_address
         key = self._key(normalized_id, proposer)
         proposer_key = canonical_address_hex(proposer)
-        consumer_value = Address(consumer) if isinstance(consumer, bytes) else consumer
-        if canonical_address_hex(consumer_value) == "0x" + ("0" * 40):
-            raise gl.vm.UserError("[EXPECTED] Zero consumer")
         used = self.submitter_case_counts.get(proposer_key)
         used_count = int(used) if used is not None else 0
         if self.cases.get(key) is not None or used_count >= MAX_CASES_PER_SUBMITTER:
             raise gl.vm.UserError("[EXPECTED] Case unavailable or submitter capacity reached")
-
-        product_name_value = bounded_text(product_name, "product_name", MAX_PRODUCT_FIELD)
-        model_value = bounded_text(model, "model", MAX_PRODUCT_FIELD)
-        batch_value = bounded_text(batch, "batch", MAX_PRODUCT_FIELD)
-        market_value = bounded_text(market, "market", MAX_PRODUCT_FIELD)
-        summary_value = bounded_text(summary, "summary", MAX_TEXT)
-        product_hash_value = canonical_sha256(product_record_hash)
-        notice_hash_value = canonical_sha256(recall_notice_hash)
-        product_url_value = valid_https_url(product_record_url, "product_record_url")
-        notice_url_value = valid_https_url(recall_notice_url, "recall_notice_url")
-        image_url_value = ""
-        image_hash_value = ""
-        if bool(str(label_image_url).strip()) != bool(str(label_image_hash).strip()):
-            raise gl.vm.UserError("[EXPECTED] Image URL and hash must be provided together")
-        if str(label_image_url).strip():
-            image_url_value = valid_https_url(label_image_url, "label_image_url")
-            image_hash_value = canonical_sha256(label_image_hash)
-        if product_url_value == notice_url_value:
-            raise gl.vm.UserError("[EXPECTED] Evidence URLs must differ")
-        if image_url_value and image_url_value in (product_url_value, notice_url_value):
-            raise gl.vm.UserError("[EXPECTED] Evidence URLs must differ")
-
-        now = u256(int(datetime.now(timezone.utc).timestamp()))
         self.cases[key] = RecallCase(
             normalized_id,
             product_name_value,
@@ -418,18 +514,229 @@ class RecallScope(gl.Contract):
             "unclear",
             u256(0),
             "",
-            now,
+            u256(int(datetime.now(timezone.utc).timestamp())),
             u256(0),
             u256(0),
+            evidence_mode,
+            authority_id,
+            str(authority.get("name", "")),
+            str(authority.get("signer_fingerprint", "")),
+            str(authority.get("signer_modulus", "")),
+            str(authority.get("domains", "")),
+            str(authority.get("markets", "")),
+            str(authority.get("products", "")),
+            u256(int(authority.get("revision", 0))),
+            evidence_mode == AUTHORITY_BOUND,
+            notice_hash_value if evidence_mode == AUTHORITY_BOUND else "",
+            manifest_hash,
+            manifest_signature,
+            recall_reference,
+            u256(issued_at),
+            u256(expires_at),
         )
         self.submitter_case_counts[proposer_key] = u256(used_count + 1)
-        RecallCaseSubmitted(normalized_id, proposer, consumer).emit()
+        RecallCaseSubmitted(normalized_id, proposer, consumer_value, evidence_mode=evidence_mode).emit()
+
+    def _common_inputs(
+        self,
+        case_id: str,
+        product_name: str,
+        model: str,
+        batch: str,
+        market: str,
+        consumer: Address,
+        product_record_url: str,
+        product_record_hash: str,
+        recall_notice_url: str,
+        recall_notice_hash: str,
+        label_image_url: str,
+        label_image_hash: str,
+        summary: str,
+    ) -> dict:
+        normalized_id = valid_case_id(case_id)
+        consumer_value = Address(consumer) if isinstance(consumer, bytes) else consumer
+        if canonical_address_hex(consumer_value) == "0x" + ("0" * 40):
+            raise gl.vm.UserError("[EXPECTED] Zero consumer")
+        product_name_value = bounded_text(product_name, "product_name", MAX_PRODUCT_FIELD)
+        model_value = bounded_text(model, "model", MAX_PRODUCT_FIELD)
+        batch_value = bounded_text(batch, "batch", MAX_PRODUCT_FIELD)
+        market_value = bounded_text(market, "market", MAX_PRODUCT_FIELD)
+        summary_value = bounded_text(summary, "summary", MAX_TEXT)
+        product_hash_value = canonical_sha256(product_record_hash)
+        notice_hash_value = canonical_sha256(recall_notice_hash)
+        product_url_value = valid_https_url(product_record_url, "product_record_url")
+        notice_url_value = valid_https_url(recall_notice_url, "recall_notice_url")
+        image_url_value = ""
+        image_hash_value = ""
+        if bool(str(label_image_url).strip()) != bool(str(label_image_hash).strip()):
+            raise gl.vm.UserError("[EXPECTED] Image URL and hash must be provided together")
+        if str(label_image_url).strip():
+            image_url_value = valid_https_url(label_image_url, "label_image_url")
+            image_hash_value = canonical_sha256(label_image_hash)
+        if product_url_value == notice_url_value:
+            raise gl.vm.UserError("[EXPECTED] Evidence URLs must differ")
+        if image_url_value and image_url_value in (product_url_value, notice_url_value):
+            raise gl.vm.UserError("[EXPECTED] Evidence URLs must differ")
+        return {
+            "case_id": normalized_id,
+            "product_name": product_name_value,
+            "model": model_value,
+            "batch": batch_value,
+            "market": market_value,
+            "consumer": consumer_value,
+            "product_url": product_url_value,
+            "product_hash": product_hash_value,
+            "notice_url": notice_url_value,
+            "notice_hash": notice_hash_value,
+            "image_url": image_url_value,
+            "image_hash": image_hash_value,
+            "summary": summary_value,
+        }
+
+    @gl.public.write
+    def submit_case(
+        self,
+        case_id: str,
+        product_name: str,
+        model: str,
+        batch: str,
+        market: str,
+        consumer: Address,
+        product_record_url: str,
+        product_record_hash: str,
+        recall_notice_url: str,
+        recall_notice_hash: str,
+        label_image_url: str,
+        label_image_hash: str,
+        summary: str,
+    ) -> None:
+        values = self._common_inputs(
+            case_id, product_name, model, batch, market, consumer,
+            product_record_url, product_record_hash, recall_notice_url,
+            recall_notice_hash, label_image_url, label_image_hash, summary,
+        )
+        self._store_case(
+            values["case_id"], values["product_name"], values["model"],
+            values["batch"], values["market"], values["consumer"],
+            values["product_url"], values["product_hash"], values["notice_url"],
+            values["notice_hash"], values["image_url"], values["image_hash"],
+            values["summary"], OPEN_EVIDENCE, {}, "", "", "", "", 0, 0,
+        )
+
+    @gl.public.write
+    def submit_authority_bound_case(
+        self,
+        case_id: str,
+        product_name: str,
+        model: str,
+        batch: str,
+        market: str,
+        consumer: Address,
+        product_record_url: str,
+        product_record_hash: str,
+        recall_notice_url: str,
+        recall_notice_hash: str,
+        label_image_url: str,
+        label_image_hash: str,
+        summary: str,
+        authority_id: str,
+        recall_reference: str,
+        issued_at: u256,
+        expires_at: u256,
+        manifest_signature: str,
+    ) -> None:
+        values = self._common_inputs(
+            case_id, product_name, model, batch, market, consumer,
+            product_record_url, product_record_hash, recall_notice_url,
+            recall_notice_hash, label_image_url, label_image_hash, summary,
+        )
+        key = valid_case_id(authority_id)
+        reference = valid_case_id(recall_reference)
+        authority = self._registry_authority(key)
+        if not isinstance(authority, dict) or not authority or authority.get("authority_id") != key:
+            raise gl.vm.UserError("[EXPECTED] Unknown authority")
+        if authority.get("active") is not True:
+            raise gl.vm.UserError("[EXPECTED] Authority is inactive or revoked")
+        revision = int(authority.get("revision", 0))
+        if revision <= 0:
+            raise gl.vm.UserError("[EXPECTED] Invalid authority revision")
+        if notice_host(values["notice_url"]) not in str(authority.get("domains", "")).split("|"):
+            raise gl.vm.UserError("[EXPECTED] Notice domain is not authorised")
+        if values["market"] not in str(authority.get("markets", "")).split("|"):
+            raise gl.vm.UserError("[EXPECTED] Market is outside authority scope")
+        if values["product_name"] not in str(authority.get("products", "")).split("|"):
+            raise gl.vm.UserError("[EXPECTED] Product is outside authority scope")
+        now = int(datetime.now(timezone.utc).timestamp())
+        issued = int(issued_at)
+        expires = int(expires_at)
+        if issued <= 0 or issued > now or now - issued > MAX_MANIFEST_LIFETIME:
+            raise gl.vm.UserError("[EXPECTED] Manifest issue time is invalid or stale")
+        if expires != 0 and (expires <= now or expires <= issued or expires - issued > MAX_MANIFEST_LIFETIME):
+            raise gl.vm.UserError("[EXPECTED] Manifest is expired or has an invalid expiry")
+        canonical = canonical_manifest_bytes(
+            int(gl.message.chain_id),
+            canonical_address_hex(gl.message.contract_address),
+            canonical_address_hex(self.authority_registry),
+            values["case_id"], key, revision, values["notice_hash"],
+            values["product_name"], values["model"], values["batch"],
+            values["market"], issued, expires, reference,
+        )
+        manifest_hash = content_sha256(canonical)
+        if not rsa_pkcs1_v15_sha256_verify(
+            str(authority.get("signer_modulus", "")), manifest_signature, manifest_hash,
+        ):
+            raise gl.vm.UserError("[EXPECTED] Authority signature invalid")
+        self._store_case(
+            values["case_id"], values["product_name"], values["model"],
+            values["batch"], values["market"], values["consumer"],
+            values["product_url"], values["product_hash"], values["notice_url"],
+            values["notice_hash"], values["image_url"], values["image_hash"],
+            values["summary"], AUTHORITY_BOUND, authority, key, manifest_hash,
+            str(manifest_signature).lower(), reference, issued, expires,
+        )
 
     @gl.public.write
     def review_case(self, case_id: str, proposer: Address) -> None:
         case = self._require_case(case_id, proposer)
         if case.status != PENDING:
             raise gl.vm.UserError("[EXPECTED] Case is not reviewable")
+
+        if case.evidence_mode == AUTHORITY_BOUND:
+            current_authority = self._registry_authority(str(case.authority_id))
+            if not authority_snapshot_matches(case, current_authority):
+                case.status = AUTHORITY_REVOKED
+                case.reviewed_at = u256(int(datetime.now(timezone.utc).timestamp()))
+                RecallCaseReviewed(
+                    str(case.case_id), case.proposer, AUTHORITY_REVOKED,
+                    authority_id=str(case.authority_id),
+                ).emit()
+                return
+            if int(case.manifest_expires_at) != 0 and int(case.manifest_expires_at) <= int(datetime.now(timezone.utc).timestamp()):
+                case.status = AUTHORITY_EXPIRED
+                case.reviewed_at = u256(int(datetime.now(timezone.utc).timestamp()))
+                RecallCaseReviewed(
+                    str(case.case_id), case.proposer, AUTHORITY_EXPIRED,
+                    authority_id=str(case.authority_id),
+                ).emit()
+                return
+            canonical = canonical_manifest_bytes(
+                int(gl.message.chain_id),
+                canonical_address_hex(gl.message.contract_address),
+                canonical_address_hex(self.authority_registry),
+                str(case.case_id), str(case.authority_id), int(case.authority_revision),
+                str(case.recall_notice_hash), str(case.product_name), str(case.model),
+                str(case.batch), str(case.market), int(case.manifest_issued_at),
+                int(case.manifest_expires_at), str(case.recall_reference),
+            )
+            if (
+                not case.authority_verified
+                or case.signed_notice_hash != case.recall_notice_hash
+                or content_sha256(canonical) != case.manifest_hash
+                or not rsa_pkcs1_v15_sha256_verify(
+                    str(case.authority_modulus), str(case.manifest_signature), case.manifest_hash,
+                )
+            ):
+                raise gl.vm.UserError("[EXPECTED] Stored authority proof is invalid")
 
         # Copy persistent fields before entering nondeterministic execution.
         product_name = str(case.product_name)
@@ -515,6 +822,10 @@ class RecallScope(gl.Contract):
             raise gl.vm.UserError("[EXPECTED] Designated consumer only")
         if case.status != RECALL_APPLIES:
             raise gl.vm.UserError("[EXPECTED] No unacknowledged applicable recall")
+        if case.evidence_mode == AUTHORITY_BOUND and not authority_snapshot_matches(
+            case, self._registry_authority(str(case.authority_id)),
+        ):
+            raise gl.vm.UserError("[EXPECTED] Authority is no longer active")
         case.status = ACKNOWLEDGED
         case.acknowledged_at = u256(int(datetime.now(timezone.utc).timestamp()))
         RecallActionAcknowledged(str(case.case_id), case.proposer, case.consumer).emit()
@@ -530,6 +841,14 @@ class RecallScope(gl.Contract):
     @gl.public.view
     def get_case(self, case_id: str, proposer: Address) -> dict:
         case = self._require_case(case_id, proposer)
+        authority_status = "not_applicable"
+        if case.evidence_mode == AUTHORITY_BOUND:
+            current = self._registry_authority(str(case.authority_id))
+            authority_status = (
+                "active"
+                if authority_snapshot_matches(case, current)
+                else "revoked_or_changed"
+            )
         return {
             "case_id": str(case.case_id),
             "product_name": str(case.product_name),
@@ -553,6 +872,22 @@ class RecallScope(gl.Contract):
             "submitted_at": int(case.submitted_at),
             "reviewed_at": int(case.reviewed_at),
             "acknowledged_at": int(case.acknowledged_at),
+            "evidence_mode": str(case.evidence_mode),
+            "authority_id": str(case.authority_id),
+            "authority_name": str(case.authority_name),
+            "authority_signer_fingerprint": str(case.authority_signer_fingerprint),
+            "authority_domains_snapshot": str(case.authority_domains),
+            "authority_markets_snapshot": str(case.authority_markets),
+            "authority_products_snapshot": str(case.authority_products),
+            "authority_revision": int(case.authority_revision),
+            "authority_verified": bool(case.authority_verified),
+            "signed_notice_hash": str(case.signed_notice_hash),
+            "manifest_hash": str(case.manifest_hash),
+            "manifest_signature": str(case.manifest_signature),
+            "recall_reference": str(case.recall_reference),
+            "manifest_issued_at": int(case.manifest_issued_at),
+            "manifest_expires_at": int(case.manifest_expires_at),
+            "authority_status": AUTHORITY_REVOKED if case.status == AUTHORITY_REVOKED else authority_status,
         }
 
     @gl.public.view
@@ -566,9 +901,44 @@ class RecallScope(gl.Contract):
         market: str,
     ) -> bool:
         case = self._require_case(case_id, proposer)
+        if case.evidence_mode == AUTHORITY_BOUND and not authority_snapshot_matches(
+            case, self._registry_authority(str(case.authority_id)),
+        ):
+            return False
         return (
             case.status in (RECALL_APPLIES, ACKNOWLEDGED)
             and case.applicability == "applies"
+            and case.product_name == clean_text(product_name)
+            and case.model == clean_text(model)
+            and case.batch == clean_text(batch)
+            and case.market == clean_text(market)
+            and case.required_action not in ("none", "unclear")
+            and int(case.confidence) >= MIN_CONFIDENCE
+        )
+
+    @gl.public.view
+    def is_authoritative_action_required_for(
+        self,
+        case_id: str,
+        proposer: Address,
+        product_name: str,
+        model: str,
+        batch: str,
+        market: str,
+    ) -> bool:
+        case = self._require_case(case_id, proposer)
+        if case.evidence_mode != AUTHORITY_BOUND or not case.authority_verified:
+            return False
+        authority = self._registry_authority(str(case.authority_id))
+        if not authority_snapshot_matches(case, authority):
+            return False
+        return (
+            case.status in (RECALL_APPLIES, ACKNOWLEDGED)
+            and case.applicability == "applies"
+            and case.signed_notice_hash == case.recall_notice_hash
+            and case.product_name in str(case.authority_products).split("|")
+            and case.market in str(case.authority_markets).split("|")
+            and notice_host(case.recall_notice_url) in str(case.authority_domains).split("|")
             and case.product_name == clean_text(product_name)
             and case.model == clean_text(model)
             and case.batch == clean_text(batch)
@@ -587,6 +957,8 @@ class RecallScope(gl.Contract):
         return {
             "name": "RecallScope",
             "version": VERSION,
+            "authority_registry": canonical_address_hex(self.authority_registry),
+            "evidence_modes": [OPEN_EVIDENCE, AUTHORITY_BOUND],
             "purpose": "Hash-bound semantic recall applicability assessment",
             "minimum_confidence": MIN_CONFIDENCE,
             "max_artifact_bytes": MAX_ARTIFACT_BYTES,
@@ -594,5 +966,5 @@ class RecallScope(gl.Contract):
             "max_cases_per_submitter_lifetime": MAX_CASES_PER_SUBMITTER,
             "applicability_values": list(APPLICABILITY_VALUES),
             "required_actions": list(ACTION_VALUES),
-            "statuses": [PENDING, RECALL_APPLIES, NOT_APPLICABLE, INCONCLUSIVE, CANCELLED, ACKNOWLEDGED],
+            "statuses": [PENDING, RECALL_APPLIES, NOT_APPLICABLE, INCONCLUSIVE, CANCELLED, ACKNOWLEDGED, AUTHORITY_REVOKED, AUTHORITY_EXPIRED],
         }
