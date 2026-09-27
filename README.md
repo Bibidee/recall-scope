@@ -2,7 +2,7 @@
 
 RecallScope is a standalone GenLayer Intelligent Contract primitive for assessing whether a committed product-safety recall notice applies to one exact product, model, batch, and market. It independently verifies the raw bytes of both the product record and recall notice, then uses validator consensus for the semantic scope judgment.
 
-RecallScope is contract-only: no frontend, token, escrow, or off-chain decision service. It is currently an undeployed v0.1.0 development candidate. No deployment, live transaction, or source-parity claim is made.
+RecallScope is contract-only: no frontend, token, escrow, or off-chain decision service. v0.1.0 is deployed on Studionet at [0x58117a2D5a6332dDe2e303a5128D939c54270664](https://explorer-studio.genlayer.com/address/0x58117a2D5a6332dDe2e303a5128D939c54270664). The deployment transaction is [0x2db9b6d748c185bd7767ffaeade07235d114de86ec4745228b445a822100e32e](https://explorer-studio.genlayer.com/tx/0x2db9b6d748c185bd7767ffaeade07235d114de86ec4745228b445a822100e32e). Deployed source was retrieved with `genlayer-js` `getContractCode` and matched byte-for-byte to the repository contract (SHA-256 `b0bf0ed02d5e13aec238af3e88cfd5cc5e464ff7c4358d7d1c34e6a402465d31`). This is deployment evidence only: no live case submission, semantic review, or consumer acknowledgement is claimed yet.
 
 ## Why GenLayer?
 
@@ -77,4 +77,4 @@ Tests are outside `contracts/`; `contracts/` must contain exactly one deployable
 
 ## Release status
 
-**Undeployed.** No Studionet address, deployment transaction, live review, or source-parity evidence exists yet. The source must pass the release gate and be audited/frozen before the user deploys it.
+**Deployed to Studionet, live lifecycle not yet demonstrated.** See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the finalized deployment, `get_info()` result, and exact source-parity evidence. No live proposal/review/acknowledgement evidence is claimed.
