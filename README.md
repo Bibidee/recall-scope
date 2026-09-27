@@ -77,4 +77,4 @@ Tests are outside `contracts/`; `contracts/` must contain exactly one deployable
 
 ## Release status
 
-**Deployed to Studionet, live lifecycle not yet demonstrated.** See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the finalized deployment, `get_info()` result, and exact source-parity evidence. No live proposal/review/acknowledgement evidence is claimed.
+**Studionet lifecycle demonstrated.** A synthetic, explicitly fictional demo case completed `pending -> recall_applies -> acknowledged`; this demonstrates contract flow only and is not a real recall or product-safety warning. See [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for finalized transaction receipts and artifact hashes.
