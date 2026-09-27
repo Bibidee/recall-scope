@@ -1,0 +1,24 @@
+name: RecallScope release gate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  release-gate:
+    runs-on: ubuntu-latest
+    env:
+      GENVM_VERSION: v0.2.12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - name: Install pinned tooling
+        run: python -m pip install -r requirements.txt
+      - name: Fetch pinned GenVM validation artifact
+        run: genvm-lint download --version v0.2.12
+      - name: Run complete release gate
+        run: python scripts/preflight.py
